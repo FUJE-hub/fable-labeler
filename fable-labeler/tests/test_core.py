@@ -14,7 +14,7 @@ from models.color_extractor import (
     compute_color_stats, anomaly_detect_annotations,
 )
 from models.logger import OperationLogger
-from models.exporter import export_coco, export_voc, export_yolo
+from models.exporter import export_coco, export_voc, export_yolo, _validate_bbox, _validate_annotation, _validate_project
 from models.point_cloud import (
     sample_image_pixels, sample_bbox_pixels, pixels_to_point_cloud,
     generate_image_point_cloud, generate_bbox_point_cloud,
@@ -24,6 +24,7 @@ from utils import (
     safe_close_pil, snapshot_annotations, restore_annotations,
     SUPPORTED_IMAGE_EXTS, THEME, UNDO_STACK_MAX, CLICK_CYCLE_TIMEOUT,
 )
+from ui.undo_manager import UndoManager
 
 
 class TestAnnotation(unittest.TestCase):
@@ -575,6 +576,188 @@ class TestPointCloud(unittest.TestCase):
             self.assertEqual(data["count"], 1)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestUndoManager(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.project = Project(self.tmpdir)
+        self.project.add_label("cat")
+        self.project.add_label("dog")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_push_and_undo_depth(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        self.assertEqual(mgr.undo_depth, 1)
+        self.assertEqual(mgr.redo_depth, 0)
+
+    def test_undo_restores_previous_state(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0.2, 0.2, 0.8, 0.8), label="dog", ann_id="u2"))
+        self.assertEqual(len(self.project.get_annotations("a.jpg")), 2)
+        affected = mgr.undo(self.project, "a.jpg")
+        self.assertEqual(affected, "a.jpg")
+        self.assertEqual(len(self.project.get_annotations("a.jpg")), 1)
+
+    def test_redo_restores_redone_state(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0.2, 0.2, 0.8, 0.8), label="dog", ann_id="u2"))
+        mgr.undo(self.project, "a.jpg")
+        affected = mgr.redo(self.project, "a.jpg")
+        self.assertEqual(affected, "a.jpg")
+        self.assertEqual(len(self.project.get_annotations("a.jpg")), 2)
+
+    def test_undo_empty_returns_none(self):
+        mgr = UndoManager()
+        result = mgr.undo(self.project, "a.jpg")
+        self.assertIsNone(result)
+
+    def test_redo_empty_returns_none(self):
+        mgr = UndoManager()
+        result = mgr.redo(self.project, "a.jpg")
+        self.assertIsNone(result)
+
+    def test_push_clears_redo(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0.2, 0.2, 0.8, 0.8), label="dog", ann_id="u2"))
+        mgr.undo(self.project, "a.jpg")
+        self.assertEqual(mgr.redo_depth, 1)
+        mgr.push(self.project, "a.jpg")
+        self.assertEqual(mgr.redo_depth, 0)
+
+    def test_clear(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        mgr.clear()
+        self.assertEqual(mgr.undo_depth, 0)
+        self.assertEqual(mgr.redo_depth, 0)
+
+    def test_cross_image_undo(self):
+        mgr = UndoManager()
+        self.project.add_annotation("a.jpg", Annotation(bbox=(0, 0, 1, 1), label="cat", ann_id="u1"))
+        mgr.push(self.project, "a.jpg")
+        self.project.add_annotation("b.jpg", Annotation(bbox=(0, 0, 1, 1), label="dog", ann_id="u2"))
+        mgr.push(self.project, "b.jpg")
+        affected = mgr.undo(self.project, "a.jpg")
+        self.assertEqual(affected, "b.jpg")
+
+
+class TestExportValidation(unittest.TestCase):
+    def test_validate_bbox_valid(self):
+        self.assertTrue(_validate_bbox((0.1, 0.2, 0.8, 0.9)))
+
+    def test_validate_bbox_reversed(self):
+        self.assertFalse(_validate_bbox((0.9, 0.2, 0.1, 0.9)))
+
+    def test_validate_bbox_negative(self):
+        self.assertFalse(_validate_bbox((-0.1, 0.2, 0.8, 0.9)))
+
+    def test_validate_bbox_exceeds_one(self):
+        self.assertFalse(_validate_bbox((0.1, 0.2, 1.1, 0.9)))
+
+    def test_validate_bbox_wrong_length(self):
+        self.assertFalse(_validate_bbox((0.1, 0.2, 0.8)))
+
+    def test_validate_bbox_zero_area(self):
+        self.assertFalse(_validate_bbox((0.5, 0.5, 0.5, 0.9)))
+
+    def test_validate_annotation_valid(self):
+        ann = Annotation(bbox=(0.1, 0.2, 0.8, 0.9), label="cat", ann_id="v1")
+        valid, msg = _validate_annotation(ann)
+        self.assertTrue(valid)
+        self.assertEqual(msg, "")
+
+    def test_validate_annotation_empty_label(self):
+        ann = Annotation(bbox=(0.1, 0.2, 0.8, 0.9), label="", ann_id="v2")
+        valid, msg = _validate_annotation(ann)
+        self.assertFalse(valid)
+        self.assertIn("空标签", msg)
+
+    def test_validate_annotation_whitespace_label(self):
+        ann = Annotation(bbox=(0.1, 0.2, 0.8, 0.9), label="   ", ann_id="v3")
+        valid, msg = _validate_annotation(ann)
+        self.assertFalse(valid)
+        self.assertIn("空标签", msg)
+
+    def test_validate_annotation_invalid_bbox(self):
+        ann = Annotation(bbox=(0.9, 0.2, 0.1, 0.9), label="cat", ann_id="v4")
+        valid, msg = _validate_annotation(ann)
+        self.assertFalse(valid)
+        self.assertIn("无效 bbox", msg)
+
+    def test_validate_project_all_valid(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            p = Project(tmpdir)
+            p.add_annotation("a.jpg", Annotation(bbox=(0.1, 0.2, 0.3, 0.4), label="cat", ann_id="p1"))
+            p.add_annotation("a.jpg", Annotation(bbox=(0.5, 0.6, 0.8, 0.9), label="dog", ann_id="p2"))
+            valid, errors = _validate_project(p)
+            self.assertTrue(valid)
+            self.assertEqual(errors, [])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_validate_project_with_invalid(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            p = Project(tmpdir)
+            p.add_annotation("a.jpg", Annotation(bbox=(0.1, 0.2, 0.3, 0.4), label="cat", ann_id="p1"))
+            p.add_annotation("b.jpg", Annotation(bbox=(0.9, 0.2, 0.1, 0.9), label="dog", ann_id="p2"))
+            valid, errors = _validate_project(p)
+            self.assertFalse(valid)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("b.jpg", errors[0])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestAnomalyConfidence(unittest.TestCase):
+    def _make_ann(self, stats, ann_id):
+        a = Annotation(bbox=(0, 0, 1, 1), label="x", ann_id=ann_id)
+        a.color_stats = stats
+        return a
+
+    def _base_stats(self):
+        return {
+            "mean_rgb": [128, 64, 32],
+            "std_rgb": [10, 10, 10],
+            "brightness_mean": 0.4,
+            "saturation_mean": 0.3,
+            "hsv": {"hue_mean": 30, "hue_std": 5, "saturation_hsv_mean": 0.5, "value_mean": 0.5},
+        }
+
+    def test_low_confidence_with_two_samples(self):
+        anns = [self._make_ann(self._base_stats(), f"c{i}") for i in range(2)]
+        result = anomaly_detect_annotations(anns)
+        self.assertEqual(result["confidence"], "low")
+
+    def test_medium_confidence_with_five_samples(self):
+        anns = [self._make_ann(self._base_stats(), f"c{i}") for i in range(5)]
+        result = anomaly_detect_annotations(anns)
+        self.assertEqual(result["confidence"], "medium")
+
+    def test_high_confidence_with_ten_samples(self):
+        anns = [self._make_ann(self._base_stats(), f"c{i}") for i in range(10)]
+        result = anomaly_detect_annotations(anns)
+        self.assertEqual(result["confidence"], "high")
+        self.assertIn("可靠", result["confidence_note"])
+
+    def test_confidence_note_present(self):
+        anns = [self._make_ann(self._base_stats(), f"c{i}") for i in range(3)]
+        result = anomaly_detect_annotations(anns)
+        self.assertIn("confidence", result)
+        self.assertIn("confidence_note", result)
 
 
 if __name__ == "__main__":

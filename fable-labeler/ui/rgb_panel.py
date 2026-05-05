@@ -132,6 +132,8 @@ class RGBPanel(tk.Frame):
             anomaly_info = (f"\n异常检测: {anomaly.get('anomaly_count', 0)} 异常 / "
                           f"{anomaly.get('suspicious_count', 0)} 可疑 / "
                           f"{anomaly.get('normal_count', 0)} 正常")
+            if anomaly.get("confidence") == "low":
+                anomaly_info += f"\n⚠ {anomaly['confidence_note']}"
 
         self.score_label.config(text=f"平均分: {report['avg_score']:.2f}")
         self.stats_label.config(
@@ -155,8 +157,14 @@ class RGBPanel(tk.Frame):
             count = info.get("count", 0)
             images = info.get("images_count", 0)
             anomalies = info.get("anomaly_count", 0)
+            conf = info.get("confidence", "high")
             if score is not None:
-                lines.append(f"[{label}] {status} (score={score:.2f})")
+                conf_note = ""
+                if conf == "low":
+                    conf_note = " ⚠样本不足"
+                elif conf == "medium":
+                    conf_note = " △样本偏少"
+                lines.append(f"[{label}] {status} (score={score:.2f}){conf_note}")
                 lines.append(f"  {count}个标注 / {images}张图 / {anomalies}异常")
             else:
                 lines.append(f"[{label}] {status} ({count}个)")

@@ -11,6 +11,36 @@ if TYPE_CHECKING:
     from models.annotation import Project
 
 
+def _validate_bbox(bbox: tuple) -> bool:
+    """验证 bbox 坐标是否在 [0, 1] 范围内且格式正确"""
+    if len(bbox) != 4:
+        return False
+    x1, y1, x2, y2 = bbox
+    return (0 <= x1 <= 1 and 0 <= y1 <= 1 and 
+            0 <= x2 <= 1 and 0 <= y2 <= 1 and 
+            x1 < x2 and y1 < y2)
+
+
+def _validate_annotation(ann) -> tuple[bool, str]:
+    """验证单个标注是否有效"""
+    if not ann.label or ann.label.strip() == "":
+        return False, "空标签"
+    if not _validate_bbox(ann.bbox):
+        return False, f"无效 bbox 坐标: {ann.bbox}"
+    return True, ""
+
+
+def _validate_project(project: Project) -> tuple[bool, list[str]]:
+    """验证项目中所有标注的有效性"""
+    errors = []
+    for image_name, anns in project.image_annotations.items():
+        for i, ann in enumerate(anns):
+            valid, reason = _validate_annotation(ann)
+            if not valid:
+                errors.append(f"图片 {image_name} 标注 {i+1}: {reason}")
+    return len(errors) == 0, errors
+
+
 def export_coco(project: Project, output_path: str) -> tuple[int, int, int]:
     images = []
     annotations = []

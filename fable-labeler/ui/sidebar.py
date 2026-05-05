@@ -166,10 +166,24 @@ class Sidebar(tk.Frame):
         return self.label_listbox.get(sel[0]) if sel else None
 
     def set_annotations_list(self, annotations):
-        self.ann_listbox.delete(0, tk.END)
-        for i, ann in enumerate(annotations):
+        lb = self.ann_listbox
+        prev_count = lb.size()
+        new_count = len(annotations)
+        common = min(prev_count, new_count)
+        for i in range(common):
+            ann = annotations[i]
             prefix = ann.id[:6] if hasattr(ann, 'id') and ann.id else f"{i+1}"
-            self.ann_listbox.insert(tk.END, f"[{prefix}] {ann.label}")
+            text = f"[{prefix}] {ann.label}"
+            if lb.get(i) != text:
+                lb.delete(i)
+                lb.insert(i, text)
+        if new_count > prev_count:
+            for i in range(prev_count, new_count):
+                ann = annotations[i]
+                prefix = ann.id[:6] if hasattr(ann, 'id') and ann.id else f"{i+1}"
+                lb.insert(tk.END, f"[{prefix}] {ann.label}")
+        elif new_count < prev_count:
+            lb.delete(new_count, tk.END)
 
     def highlight_ann(self, index):
         self.ann_listbox.selection_clear(0, tk.END)

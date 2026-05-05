@@ -125,7 +125,8 @@ class CanvasWidget(tk.Frame):
         if new_scale != self._cached_scale or self._cached_photo is None:
             w = max(1, int(self.image.width * self.scale))
             h = max(1, int(self.image.height * self.scale))
-            resized = self.image.resize((w, h), Image.NEAREST)
+            interp = Image.NEAREST if self.scale >= 2.0 else Image.BILINEAR
+            resized = self.image.resize((w, h), interp)
             self._cached_photo = ImageTk.PhotoImage(resized)
             self._cached_scale = new_scale
         self.tk_image = self._cached_photo
@@ -355,17 +356,15 @@ class CanvasWidget(tk.Frame):
 
     def on_release(self, event):
         if self._drag_mode == "move" and self.selected_index >= 0:
+            self._drag_mode = None
             if self.on_box_moved:
                 self.on_box_moved(self.selected_index, self.annotations[self.selected_index].bbox)
-            self._drag_mode = None
-            self.redraw()
             return
         if self._drag_mode == "resize" and self.selected_index >= 0:
-            if self.on_box_resized:
-                self.on_box_resized(self.selected_index, self.annotations[self.selected_index].bbox)
             self._drag_mode = None
             self._drag_handle = None
-            self.redraw()
+            if self.on_box_resized:
+                self.on_box_resized(self.selected_index, self.annotations[self.selected_index].bbox)
             return
         if not self.drawing:
             return
@@ -415,9 +414,11 @@ class CanvasWidget(tk.Frame):
         dy = event.y - self._pan_start_y
         self._pan_x += dx
         self._pan_y += dy
+        self.offset_x += dx
+        self.offset_y += dy
         self._pan_start_x = event.x
         self._pan_start_y = event.y
-        self.redraw()
+        self.canvas.move("all", dx, dy)
 
     def on_pan_end(self, event):
         self._panning = False
@@ -435,13 +436,28 @@ class CanvasWidget(tk.Frame):
         self._ann_canvas_ids.clear()
         self.redraw()
 
+    def _undraw_annotation(self, index):
+        ids = self._ann_canvas_ids.pop(index, None)
+        if ids:
+            self.canvas.delete(ids["rect"])
+            self.canvas.delete(ids["text"])
+            for h in ids.get("handles", []):
+                self.canvas.delete(h)
+
     def select_annotation(self, index):
+        old_sel = self.selected_index
         self.selected_index = index
-        self._ann_canvas_ids.clear()
-        self.redraw()
+        if 0 <= old_sel < len(self.annotations) and old_sel != index:
+            self._undraw_annotation(old_sel)
+            self._draw_annotation(old_sel, self.annotations[old_sel])
+        if 0 <= index < len(self.annotations):
+            self._undraw_annotation(index)
+            self._draw_annotation(index, self.annotations[index])
 
     def clear_selection(self):
+        old_sel = self.selected_index
         self.selected_index = -1
         self._drag_mode = None
-        self._ann_canvas_ids.clear()
-        self.redraw()
+        if 0 <= old_sel < len(self.annotations):
+            self._undraw_annotation(old_sel)
+            self._draw_annotation(old_sel, self.annotations[old_sel])

@@ -11,20 +11,20 @@ from models.color_extractor import (
 )
 from models.point_cloud import (
     generate_image_point_cloud, generate_bbox_point_cloud,
-    export_point_cloud_csv, export_point_cloud_json,
 )
 from models.logger import OperationLogger
-from models.exporter import export_coco, export_voc, export_yolo
 from models import config as cfg_module
 from ui.canvas_widget import CanvasWidget
 from ui.sidebar import Sidebar
 from ui.rgb_panel import RGBPanel
 from ui.pointcloud_panel import PointCloudPanel
+from ui.undo_manager import UndoManager
+from ui.export_controller import ExportController
 from utils import (
-    THEME, UNDO_STACK_MAX, DEFAULT_WINDOW_SIZE,
+    THEME, DEFAULT_WINDOW_SIZE,
     FONT_LABEL, FONT_LABEL_BOLD, FONT_BUTTON,
     FONT_MONO, FONT_STATUS,
-    center_window, safe_close_pil, snapshot_annotations, restore_annotations,
+    center_window, safe_close_pil,
     make_button, make_label,
 )
 
@@ -54,15 +54,21 @@ class MainWindow:
         self.current_point_cloud = None
         self._label_popup = None
         self._label_popup_ann_index = -1
-        self._undo_stack = []
-        self._redo_stack = []
+        self._undo_mgr = UndoManager()
+        self._export_ctrl = ExportController(
+            get_project=lambda: self.project,
+            on_status=lambda msg: self.status_bar.config(text=msg),
+        )
         self._logger = None
         self._last_used_label = None
         self._preload_cache = {}
         self._cross_image_cache = None
         self._labeled_count = 0
         self._total_anns_count = 0
+        self._prev_image_index = -1
         self._dirty = False
+        self._prev_image_name = None
+        self._prev_ann_count = -1
 
         self._build_menu()
         self._build_layout()
@@ -228,8 +234,7 @@ class MainWindow:
         self._init_logger(folder)
         self.sidebar.set_images(files)
         self.sidebar.set_labels(self.project.labels)
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._undo_mgr.clear()
         self._preload_cache.clear()
         self._cross_image_cache = None
         self._labeled_count = 0
@@ -389,6 +394,7 @@ class MainWindow:
         self._push_undo("create")
         ann = Annotation(bbox=bbox, label=selected_label)
         self.project.add_annotation(image_name, ann)
+        self._dirty = True
         self.canvas_widget.set_annotations(self.project.get_annotations(image_name))
         if self._logger:
             idx = len(self.project.get_annotations(image_name)) - 1
@@ -405,9 +411,13 @@ class MainWindow:
         self._push_undo("drag")
 
     def on_box_moved(self, index, bbox):
+        self._dirty = True
+        self._update_status()
         self.status_bar.config(text=f"已移动标注 {index+1}")
 
     def on_box_resized(self, index, bbox):
+        self._dirty = True
+        self._update_status()
         self.status_bar.config(text=f"已缩放标注 {index+1}")
 
     # ── Label management callbacks ────────────────────────
@@ -447,6 +457,7 @@ class MainWindow:
             if idx < len(anns):
                 self._push_undo("relabel")
                 anns[idx].label = label
+                self._dirty = True
                 self.canvas_widget.redraw()
                 self._last_used_label = label
                 self.status_bar.config(text=f"已将标注 {idx+1} 标签改为: {label}")
@@ -514,6 +525,7 @@ class MainWindow:
             self._push_undo("relabel")
             old_label = anns[ann_index].label
             anns[ann_index].label = label
+            self._dirty = True
             self.canvas_widget.redraw()
             self.status_bar.config(text=f"已将标注 {ann_index+1} 标签设为: {label}")
             if self._logger:
@@ -531,43 +543,47 @@ class MainWindow:
             self._label_popup = None
         self.canvas_widget.clear_selection()
 
-    # ── Undo / Redo (snapshot = dict list, not Annotation objects) ───
+    # ── Undo / Redo (delegated to UndoManager) ───────────
     def _push_undo(self, action):
         if not self.project or self.current_index < 0:
             return
         self._cross_image_cache = None
         files = self.project.get_image_files()
-        image_name = files[self.current_index]
-        anns = self.project.get_annotations(image_name)
-        self._undo_stack.append((image_name, snapshot_annotations(anns)))
-        self._redo_stack.clear()
-        stack_limit = cfg_module.get("undo_stack_size", UNDO_STACK_MAX)
-        if len(self._undo_stack) > stack_limit:
-            self._undo_stack.pop(0)
+        self._undo_mgr.push(self.project, files[self.current_index])
 
     def undo_annotation(self):
-        if not self._undo_stack:
+        if not self.project or self.current_index < 0:
             return
-        image_name = self.project.get_image_files()[self.current_index]
-        undo_name, undo_snapshot = self._undo_stack.pop()
-        cur_anns = self.project.get_annotations(undo_name)
-        self._redo_stack.append((undo_name, snapshot_annotations(cur_anns)))
-        self.project.set_annotations(undo_name, restore_annotations(undo_snapshot))
-        if undo_name == image_name:
-            self.canvas_widget.set_annotations(self.project.get_annotations(undo_name))
-        self._update_status()
+        files = self.project.get_image_files()
+        image_name = files[self.current_index]
+        affected_name = self._undo_mgr.undo(self.project, image_name)
+        if affected_name is None:
+            self.status_bar.config(text="无可撤销操作")
+            return
+        if affected_name != image_name:
+            target_idx = files.index(affected_name)
+            self.load_image_at(target_idx)
+        else:
+            self.canvas_widget.set_annotations(self.project.get_annotations(affected_name))
+            self._update_status()
+        self.status_bar.config(text=f"已撤销 (剩余 {self._undo_mgr.undo_depth} 步可撤销)")
 
     def redo_annotation(self):
-        if not self._redo_stack:
+        if not self.project or self.current_index < 0:
             return
-        image_name = self.project.get_image_files()[self.current_index]
-        redo_name, redo_snapshot = self._redo_stack.pop()
-        cur_anns = self.project.get_annotations(redo_name)
-        self._undo_stack.append((redo_name, snapshot_annotations(cur_anns)))
-        self.project.set_annotations(redo_name, restore_annotations(redo_snapshot))
-        if redo_name == image_name:
-            self.canvas_widget.set_annotations(self.project.get_annotations(redo_name))
-        self._update_status()
+        files = self.project.get_image_files()
+        image_name = files[self.current_index]
+        affected_name = self._undo_mgr.redo(self.project, image_name)
+        if affected_name is None:
+            self.status_bar.config(text="无可重做操作")
+            return
+        if affected_name != image_name:
+            target_idx = files.index(affected_name)
+            self.load_image_at(target_idx)
+        else:
+            self.canvas_widget.set_annotations(self.project.get_annotations(affected_name))
+            self._update_status()
+        self.status_bar.config(text=f"已重做 (剩余 {self._undo_mgr.redo_depth} 步可重做)")
 
     # ── Delete ────────────────────────────────────────────
     def delete_selected(self):
@@ -583,6 +599,7 @@ class MainWindow:
         if self._logger:
             self._logger.log_delete_annotation(image_name, ann.label, ann.bbox, idx, ann_id=ann.id)
         self.project.remove_annotation(image_name, idx)
+        self._dirty = True
         self.canvas_widget.set_annotations(self.project.get_annotations(image_name))
         self._update_status()
 
@@ -614,9 +631,13 @@ class MainWindow:
         if not anns:
             messagebox.showinfo("提示", "当前图片没有标注")
             return
-        for ann in anns:
+        total = len(anns)
+        for i, ann in enumerate(anns):
             if not ann.color_stats or "mean_rgb" not in ann.color_stats:
                 ann.color_stats = compute_color_stats(self.current_image, ann.bbox)
+            if total > 5:
+                self.status_bar.config(text=f"验证中: {i+1}/{total}...")
+                self.root.update_idletasks()
         report = validate_all_annotations(self.current_image, anns)
         batch_result = generate_batch_corrections(self.project, image_name, self.current_image)
         self.rgb_panel.display_summary(report)
@@ -752,113 +773,29 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror("保存失败", f"保存项目时出错:\n{e}")
 
-    def _ask_save_path(self, ext, filetypes, initialfile=None):
-        kwargs = {
-            "defaultextension": ext,
-            "filetypes": filetypes,
-            "initialdir": self.project.project_dir,
-        }
-        if initialfile:
-            kwargs["initialfile"] = initialfile
-        return filedialog.asksaveasfilename(**kwargs)
-
     def export_json(self):
-        if not self.project:
-            return
-        path = self._ask_save_path(".json", [("JSON", "*.json")])
-        if path:
-            try:
-                self.project.export_json(path)
-                self.status_bar.config(text=f"已导出 JSON: {path}")
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出 JSON 时出错:\n{e}")
+        self._export_ctrl.export_json()
 
     def export_csv(self):
-        if not self.project:
-            return
-        path = self._ask_save_path(".csv", [("CSV", "*.csv")])
-        if path:
-            try:
-                self.project.export_csv(path)
-                self.status_bar.config(text=f"已导出 CSV: {path}")
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出 CSV 时出错:\n{e}")
+        self._export_ctrl.export_csv()
 
     def export_coco_format(self):
-        if not self.project:
-            return
-        path = self._ask_save_path(".json", [("JSON", "*.json")], "coco_annotations.json")
-        if path:
-            try:
-                imgs, anns, cats = export_coco(self.project, path)
-                msg = f"COCO 导出完成: {imgs} 图 / {anns} 标注 / {cats} 类别"
-                self.status_bar.config(text=msg)
-                messagebox.showinfo("导出完成", msg)
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出 COCO 时出错:\n{e}")
-
-    def _ask_folder(self, title):
-        return filedialog.askdirectory(title=title, initialdir=self.project.project_dir)
+        self._export_ctrl.export_coco_format()
 
     def export_voc_format(self):
-        if not self.project:
-            return
-        folder = self._ask_folder("选择 VOC XML 输出目录")
-        if folder:
-            try:
-                count = export_voc(self.project, folder)
-                msg = f"VOC 导出完成: {count} 个 XML 文件"
-                self.status_bar.config(text=msg)
-                messagebox.showinfo("导出完成", msg)
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出 VOC 时出错:\n{e}")
+        self._export_ctrl.export_voc_format()
 
     def export_yolo_format(self):
-        if not self.project:
-            return
-        folder = self._ask_folder("选择 YOLO TXT 输出目录")
-        if folder:
-            try:
-                files, anns = export_yolo(self.project, folder)
-                msg = f"YOLO 导出完成: {files} 文件 / {anns} 标注"
-                self.status_bar.config(text=msg)
-                messagebox.showinfo("导出完成", msg)
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出 YOLO 时出错:\n{e}")
+        self._export_ctrl.export_yolo_format()
 
     def export_pc_csv(self):
-        if self.current_point_cloud is None:
-            messagebox.showinfo("提示", "请先生成点云")
-            return
-        path = self._ask_save_path(".csv", [("CSV", "*.csv")])
-        if path:
-            try:
-                export_point_cloud_csv(path, self.current_point_cloud)
-                self.status_bar.config(text=f"已导出点云 CSV: {path}")
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出点云 CSV 时出错:\n{e}")
+        self._export_ctrl.export_pc_csv(self.current_point_cloud)
 
     def export_pc_json(self):
-        if self.current_point_cloud is None:
-            messagebox.showinfo("提示", "请先生成点云")
-            return
-        path = self._ask_save_path(".json", [("JSON", "*.json")])
-        if path:
-            try:
-                export_point_cloud_json(path, self.current_point_cloud)
-                self.status_bar.config(text=f"已导出点云 JSON: {path}")
-            except Exception as e:
-                messagebox.showerror("导出失败", f"导出点云 JSON 时出错:\n{e}")
+        self._export_ctrl.export_pc_json(self.current_point_cloud)
 
     def export_logs(self):
-        if not self._logger:
-            messagebox.showinfo("提示", "请先打开图片目录")
-            return
-        self._logger.end_session()
-        path = self._logger.save()
-        self._logger.start_session()
-        self.status_bar.config(text=f"操作日志已导出: {path}")
-        messagebox.showinfo("导出完成", f"日志已保存到:\n{path}")
+        self._export_ctrl.export_logs(self._logger)
 
     # ── Status bar ────────────────────────────────────────
     def _update_status(self):
@@ -870,18 +807,14 @@ class MainWindow:
         total = len(files)
         current_count = len(anns)
 
-        self._sync_labeled_count(files, image_name, current_count)
+        self._sync_labeled_count_incremental(image_name, current_count)
         self._update_sidebar_color(image_name, current_count)
-
-        self._prev_image_name = image_name
-        self._prev_ann_count = current_count
-        self._dirty = True
 
         self.status_bar.config(
             text=f"[{self.current_index + 1}/{total}] {image_name}  |  "
                  f"当前图片: {current_count} 个标注  |  "
                  f"已标注: {self._labeled_count}/{total} 张  |  "
-                 f"撤销栈: {len(self._undo_stack)}  |  "
+                 f"撤销栈: {self._undo_mgr.undo_depth}  |  "
                  f"缩放: {self.canvas_widget._zoom:.1f}x"
         )
         self.sidebar.set_annotations_list(anns)
@@ -894,35 +827,43 @@ class MainWindow:
             f"标签类别: {len(self.project.labels)}"
         )
 
-    def _sync_labeled_count(self, files, image_name, current_count):
-        prev_label = getattr(self, "_prev_image_name", None)
-        prev_count = getattr(self, "_prev_ann_count", -1)
+    def _sync_labeled_count_incremental(self, image_name: str, current_count: int) -> None:
+        prev_name = self._prev_image_name
+        prev_count = self._prev_ann_count
 
-        if prev_label is not None and prev_label != image_name:
-            old_count = len(self.project.get_annotations(prev_label))
-            self._total_anns_count += old_count - prev_count
-            was_labeled = prev_count > 0
-            new_labeled = old_count > 0
-            if was_labeled and not new_labeled:
-                self._labeled_count -= 1
-            elif not was_labeled and new_labeled:
-                self._labeled_count += 1
-            self._refresh_listbox_color(files, prev_label, old_count)
+        if prev_name == image_name:
+            delta = current_count - prev_count
+            if delta != 0:
+                self._total_anns_count += delta
+                was_labeled = prev_count > 0
+                now_labeled = current_count > 0
+                if not was_labeled and now_labeled:
+                    self._labeled_count += 1
+                elif was_labeled and not now_labeled:
+                    self._labeled_count -= 1
+        else:
+            if prev_name is not None:
+                prev_idx = self._prev_image_index
+                actual_prev = len(self.project.get_annotations(prev_name))
+                delta = actual_prev - prev_count
+                if delta != 0:
+                    self._total_anns_count += delta
+                    was_labeled = prev_count > 0
+                    now_labeled = actual_prev > 0
+                    if not was_labeled and now_labeled:
+                        self._labeled_count += 1
+                    elif was_labeled and not now_labeled:
+                        self._labeled_count -= 1
+                    self._refresh_listbox_color_by_index(prev_idx, actual_prev)
 
-        self._total_anns_count += current_count - (prev_count if prev_count >= 0 and prev_label == image_name else current_count)
-        if prev_label == image_name:
-            if current_count > 0 and prev_count == 0:
-                self._labeled_count += 1
-            elif current_count == 0 and prev_count > 0:
-                self._labeled_count -= 1
+        self._prev_image_name = image_name
+        self._prev_ann_count = current_count
+        self._prev_image_index = self.current_index
 
-    def _refresh_listbox_color(self, files, target_name, count):
-        for i, f in enumerate(files):
-            if f == target_name:
-                color = THEME["success"] if count > 0 else THEME["text_primary"]
-                if self.sidebar.image_listbox.size() > i:
-                    self.sidebar.image_listbox.itemconfig(i, fg=color)
-                break
+    def _refresh_listbox_color_by_index(self, index: int, count: int) -> None:
+        if 0 <= index < self.sidebar.image_listbox.size():
+            color = THEME["success"] if count > 0 else THEME["text_primary"]
+            self.sidebar.image_listbox.itemconfig(index, fg=color)
 
     def _update_sidebar_color(self, image_name, current_count):
         idx = self.current_index
@@ -936,15 +877,15 @@ class MainWindow:
             try:
                 self.project.save()
                 self._dirty = False
-            except Exception:
-                pass
+                self.status_bar.config(text="已自动保存")
+            except Exception as e:
+                self.status_bar.config(text=f"自动保存失败: {e}")
         self.root.after(AUTO_SAVE_INTERVAL_MS, self._auto_save_tick)
 
     def _on_close(self):
         self._release_current_image()
         self._clear_preload_cache()
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._undo_mgr.clear()
         if self._logger:
             self._logger.end_session()
             self._logger.save()

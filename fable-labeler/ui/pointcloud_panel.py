@@ -6,7 +6,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from utils import THEME, FONT_SECTION, FONT_BUTTON, FONT_MONO, make_button
 
-PC_DISPLAY_SAMPLE_MAX = 2000
+PC_DISPLAY_SAMPLE_MAX = 1500
+PC_DISPLAY_SAMPLE_MIN = 500
 
 
 class PointCloudPanel(tk.Frame):
@@ -83,15 +84,27 @@ class PointCloudPanel(tk.Frame):
         points = np.array(point_cloud["points"])
         colors = np.array(point_cloud["colors"])
 
-        r, g, b = points[:, 0], points[:, 1], points[:, 2]
+        # 根据点云数量动态调整采样数量，平衡性能和视觉效果
+        count = len(points)
+        if count <= PC_DISPLAY_SAMPLE_MIN:
+            sample_size = count
+        elif count <= PC_DISPLAY_SAMPLE_MAX:
+            sample_size = count
+        else:
+            # 超过最大采样数时，采用自适应采样
+            sample_size = max(PC_DISPLAY_SAMPLE_MIN, min(PC_DISPLAY_SAMPLE_MAX, count // 2))
 
-        sample_size = min(len(points), PC_DISPLAY_SAMPLE_MAX)
         if len(points) > sample_size:
-            idx = np.random.choice(len(points), sample_size, replace=False)
-            r, g, b = r[idx], g[idx], b[idx]
+            # 使用固定步长采样替代随机采样，保证结果可重复且更快
+            step = len(points) // sample_size
+            idx = np.arange(0, len(points), step)[:sample_size]
+            r, g, b = points[idx, 0], points[idx, 1], points[idx, 2]
             colors = colors[idx]
+        else:
+            r, g, b = points[:, 0], points[:, 1], points[:, 2]
 
-        self.ax.scatter(r, g, b, c=colors, s=2, alpha=0.6, depthshade=True)
+        # 使用 faster 模式渲染，关闭深度阴影以提升性能
+        self.ax.scatter(r, g, b, c=colors, s=2, alpha=0.5, depthshade=False)
 
         self.ax.set_xlim(0, 255)
         self.ax.set_ylim(0, 255)

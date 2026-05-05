@@ -258,9 +258,22 @@ def anomaly_detect_annotations(annotations: list) -> dict:
     total_suspicious = sum(1 for p in per_annotation if p["level"] == "SUSPICIOUS")
     total_normal = sum(1 for p in per_annotation if p["level"] == "NORMAL")
 
+    n = len(per_annotation)
+    if n < 3:
+        confidence = "low"
+        confidence_note = f"仅 {n} 个有效样本，结果仅供参考，建议增加标注数量"
+    elif n < 8:
+        confidence = "medium"
+        confidence_note = f"{n} 个样本，统计置信度中等"
+    else:
+        confidence = "high"
+        confidence_note = f"{n} 个样本，统计结果可靠"
+
     return {
         "method": "z_score + iqr + mahalanobis",
-        "total": len(per_annotation),
+        "total": n,
+        "confidence": confidence,
+        "confidence_note": confidence_note,
         "anomaly_count": total_anomalies,
         "suspicious_count": total_suspicious,
         "normal_count": total_normal,
@@ -413,6 +426,7 @@ def compute_cross_image_consistency(project) -> dict:
         results[label] = {
             "count": n,
             "status": status,
+            "confidence": "low" if n < 5 else ("medium" if n < 10 else "high"),
             "consistency_score": consistency_score,
             "cv_mean": round(avg_cv, 4),
             "mean_rgb": [round(v, 1) for v in mean_all[:3]],
